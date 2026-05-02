@@ -1,0 +1,8 @@
+/target/
+/stdout.log
+/stderr.log
+/dist/
+/config.toml
+/.jj/
+/.omc/
+/.DS_Store

@@ -1,0 +1,38 @@
+host = "0.0.0.0"
+port = 18081
+public_url = "http://codex-a2a-rs.example.ts.net:18081"
+
+# "cli" uses `codex exec`; "native" uses `codex app-server` JSON-RPC for
+# thread resume and turn interruption.
+backend = "cli"
+
+# Windows path examples can use forward slashes in TOML:
+# sessions_dir = "C:/Users/you/codex/sessions"
+# default_working_directory = "C:/Users/you/codex/workspace"
+sessions_dir = "/path/to/codex/sessions"
+default_working_directory = "/path/to/default/workspace"
+codex_bin = "codex"
+
+auth_token_env = "A2A_AUTH_TOKEN"
+# Store token files in a current-user-private location.
+# auth_token_file = "/path/to/token-file"
+# macOS-only Keychain fallback.
+auth_token_keychain_service = "A2A_AUTH_TOKEN"
+max_body_bytes = 1048576
+max_concurrent_tasks = 4
+read_timeout_secs = 30
+expose_local_sessions = false
+
+# Optional local-only escape hatch for write-mode tasks that need to copy from
+# read-only source trees. Keep empty for public-facing deployments.
+write_mode_sandbox_permissions = []
+
+allowed_sources = [
+  # Tailscale defaults. For local-only testing, use "127.0.0.1/32".
+  "100.64.0.0/10",
+  "fd7a:115c:a1e0::/48",
+]
+
+write_roots = [
+  "/path/to/allowed/repo",
+]
