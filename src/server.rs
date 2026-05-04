@@ -317,10 +317,7 @@ fn send_task(
         })
         .unwrap_or_else(new_id);
 
-    let (context_id, used_legacy_context_alias) = match context_key_from_params(&params) {
-        Ok(context) => context,
-        Err(message) => return invalid_params(id, message),
-    };
+    let (context_id, used_legacy_context_alias) = context_key_from_params(&params);
 
     if task_id_exists(&state, &task_id) {
         return invalid_params(id, format!("Duplicate task id: {task_id}"));
@@ -544,10 +541,7 @@ fn list_sessions(id: Value, params: Value, state: AppState) -> (u16, Value) {
 }
 
 fn resume_session(id: Value, params: Value, state: AppState) -> (u16, Value) {
-    let (context_id, used_legacy_context_alias) = match context_key_from_params(&params) {
-        Ok(context) => context,
-        Err(message) => return invalid_params(id, message),
-    };
+    let (context_id, used_legacy_context_alias) = context_key_from_params(&params);
     let Some(resume_id) = params
         .get("resumeSessionId")
         .or_else(|| params.get("codexSessionId"))
@@ -1157,6 +1151,15 @@ fn new_id() -> String {
     format!("task-{nanos}-{seq}")
 }
 
+fn new_context_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("context-{nanos}-{seq}")
+}
+
 fn write_json(stream: &mut TcpStream, status: u16, payload: &Value) -> std::io::Result<()> {
     let status_text = match status {
         200 => "OK",
@@ -1227,11 +1230,11 @@ fn context_filter_from_params(params: &Value) -> (Option<String>, bool) {
     (None, false)
 }
 
-fn context_key_from_params(params: &Value) -> Result<(String, bool), String> {
+fn context_key_from_params(params: &Value) -> (String, bool) {
     let (context_id, used_legacy_alias) = context_filter_from_params(params);
     context_id
         .map(|context_id| (context_id, used_legacy_alias))
-        .ok_or_else(|| "contextId is required".to_string())
+        .unwrap_or_else(|| (new_context_id(), false))
 }
 
 fn annotate_task(
@@ -1418,6 +1421,40 @@ fn save_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     ));
     fs::write(&tmp_path, content).map_err(|err| err.to_string())?;
     fs::rename(&tmp_path, path).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_key_generates_fresh_context_when_omitted() {
+        let (context_id, used_legacy_alias) = context_key_from_params(&json!({}));
+
+        assert!(context_id.starts_with("context-"));
+        assert!(!used_legacy_alias);
+    }
+
+    #[test]
+    fn context_key_keeps_deprecated_session_id_alias() {
+        let (context_id, used_legacy_alias) = context_key_from_params(&json!({
+            "sessionId": "legacy-session"
+        }));
+
+        assert_eq!(context_id, "legacy-session");
+        assert!(used_legacy_alias);
+    }
+
+    #[test]
+    fn context_key_prefers_context_id_over_alias() {
+        let (context_id, used_legacy_alias) = context_key_from_params(&json!({
+            "contextId": "ctx-primary",
+            "sessionId": "legacy-session"
+        }));
+
+        assert_eq!(context_id, "ctx-primary");
+        assert!(!used_legacy_alias);
+    }
 }
 
 fn now_unix_secs() -> u64 {

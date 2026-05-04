@@ -170,7 +170,7 @@ Resume a previous Codex session under a new A2A context:
 }}
 ```
 
-`message/send`, `message/stream`, and `sessions/resume` require `contextId`. `sessionId` is accepted as a deprecated alias.
+`message/send`, `message/stream`, and `sessions/resume` accept `contextId`. When omitted, the server creates a fresh context. `sessionId` is accepted as a deprecated alias.
 
 ## Tasks
 
@@ -293,7 +293,7 @@ The script rebuilds the crate, launches a local server with mock `security` and 
 - `sessions/list` and `sessions/resume`
 - `message/stream`
 - `tasks/cancel`
-- duplicate task-id rejection and missing contextId errors
+- duplicate task-id rejection and omitted contextId context creation
 - deprecated alias continuity (`tasks/send`, `sessionId`)
 
 ## License

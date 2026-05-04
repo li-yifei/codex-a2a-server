@@ -127,12 +127,13 @@ assert payload['result']['sessions'][0]['contextId'] == 'ctx-send'
 assert payload['result']['sessions'][0]['path'] == ''
 PY
 
-missing_context="$(curl -fsS -H "$auth_header" -H "$json_header" -d '{"jsonrpc":"2.0","id":"missing-context","method":"message/send","params":{"message":{"parts":[{"type":"text","text":"missing context"}]}}}' "http://127.0.0.1:$port/")"
-python3 - <<'PY' "$missing_context"
+omitted_context="$(curl -fsS -H "$auth_header" -H "$json_header" -d '{"jsonrpc":"2.0","id":"omitted-context","method":"message/send","params":{"message":{"parts":[{"type":"text","text":"omitted context"}]}}}' "http://127.0.0.1:$port/")"
+python3 - <<'PY' "$omitted_context"
 import json, sys
 payload = json.loads(sys.argv[1])
-assert payload['error']['code'] == -32602
-assert payload['error']['message'] == 'contextId is required'
+assert payload['result']['status']['state'] == 'working'
+assert payload['result']['contextId'].startswith('context-')
+assert payload['result']['metadata']['contextId'] == payload['result']['contextId']
 PY
 
 duplicate_id="$(curl -fsS -H "$auth_header" -H "$json_header" -d '{"jsonrpc":"2.0","id":"duplicate-id","method":"message/send","params":{"id":"'"$send_task_id"'","contextId":"ctx-send","message":{"parts":[{"type":"text","text":"duplicate id"}]}}}' "http://127.0.0.1:$port/")"
