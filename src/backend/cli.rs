@@ -157,7 +157,7 @@ fn append_write_mode_sandbox_permissions(
     }
     cmd.arg("-c").arg(format!(
         "sandbox_permissions={}",
-        toml_string_array(permissions)
+        shell_double_quoted_toml_string_array(permissions)
     ));
 }
 
@@ -168,6 +168,11 @@ fn toml_string_array(values: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{values}]")
+}
+
+fn shell_double_quoted_toml_string_array(values: &[String]) -> String {
+    let inner = toml_string_array(values).replace("\"", "\\\"");
+    format!("\"{inner}\"")
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {

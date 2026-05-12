@@ -6,30 +6,40 @@ use crate::config::Config;
 use crate::process::{configure_child_process, terminate_process_tree};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+const NATIVE_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct NativeBackend {
     config: Arc<Config>,
     controls: Arc<Mutex<HashMap<u32, NativeControl>>>,
 }
 
+#[derive(Clone, Copy)]
+struct NativeWire {
+    include_jsonrpc: bool,
+}
+
 #[derive(Clone)]
 struct NativeControl {
     stdin: Arc<Mutex<ChildStdin>>,
+    wire: NativeWire,
     thread_id: Arc<Mutex<Option<String>>>,
     turn_id: Arc<Mutex<Option<String>>>,
 }
 
 struct NativeTurn {
     child: Child,
-    stdout: std::process::ChildStdout,
+    stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
+    wire: NativeWire,
     stdin: Arc<Mutex<ChildStdin>>,
     shared_thread_id: Arc<Mutex<Option<String>>>,
     shared_turn_id: Arc<Mutex<Option<String>>>,
@@ -54,34 +64,16 @@ impl Backend for NativeBackend {
     }
 
     fn spawn(&self, request: BackendRequest) -> Result<BackendJob, String> {
-        let mut command = Command::new(&self.config.codex_bin);
-        command
-            .arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        configure_child_process(&mut command);
-        let mut child = command.spawn().map_err(|err| err.to_string())?;
-
-        let pid = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "failed to open native app-server stdin".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "failed to open native app-server stdout".to_string())?;
-
-        let stdin = Arc::new(Mutex::new(stdin));
+        let attempt = spawn_native_child(&self.config)?;
+        let pid = attempt.child.id();
+        let stdin = Arc::new(Mutex::new(attempt.stdin));
         let thread_id = Arc::new(Mutex::new(None));
         let turn_id = Arc::new(Mutex::new(None));
         self.controls.lock().unwrap().insert(
             pid,
             NativeControl {
                 stdin: Arc::clone(&stdin),
+                wire: attempt.wire,
                 thread_id: Arc::clone(&thread_id),
                 turn_id: Arc::clone(&turn_id),
             },
@@ -93,8 +85,10 @@ impl Backend for NativeBackend {
             pid,
             wait: Box::new(move || {
                 run_native_turn(NativeTurn {
-                    child,
-                    stdout,
+                    child: attempt.child,
+                    stdout: attempt.stdout,
+                    stderr: attempt.stderr,
+                    wire: attempt.wire,
                     stdin: Arc::clone(&stdin),
                     shared_thread_id: thread_id,
                     shared_turn_id: turn_id,
@@ -118,6 +112,7 @@ impl Backend for NativeBackend {
         match (thread_id, turn_id) {
             (Some(thread_id), Some(turn_id)) => write_request(
                 &control.stdin,
+                control.wire,
                 "turn/interrupt",
                 json!({"threadId": thread_id, "turnId": turn_id}),
             )
@@ -135,6 +130,8 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
     let NativeTurn {
         child,
         stdout,
+        mut stderr,
+        wire,
         stdin,
         shared_thread_id,
         shared_turn_id,
@@ -144,10 +141,7 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
         pid,
     } = turn;
     let mut reader = BufReader::new(stdout);
-    if let Err(err) = initialize(&mut reader, &stdin) {
-        finish_child(child, stdin, controls, pid, true);
-        return failed(err);
-    }
+    eprintln!("native worker pid={pid} started");
 
     let thread_method;
     let mut thread_params;
@@ -179,11 +173,11 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
         params.insert("config".to_string(), config_overrides);
     }
 
-    let thread_response = match call(&mut reader, &stdin, thread_method, thread_params) {
+    let thread_response = match call(&mut reader, &stdin, wire, thread_method, thread_params) {
         Ok(response) => response,
         Err(err) => {
-            finish_child(child, stdin, controls, pid, true);
-            return failed(err);
+            let stderr_text = finish_child(child, stderr.take(), stdin, controls, pid, true);
+            return failed(with_stderr(err, &stderr_text));
         }
     };
     let Some(thread_id) = thread_response
@@ -192,16 +186,16 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
         .and_then(Value::as_str)
         .map(str::to_string)
     else {
-        finish_child(child, stdin, controls, pid, true);
-        return failed(format!(
-            "native {thread_method} response did not include thread.id"
-        ));
+        let stderr_text = finish_child(child, stderr.take(), stdin, controls, pid, true);
+        let message = format!("native {thread_method} response did not include thread.id");
+        return failed(with_stderr(message, &stderr_text));
     };
     *shared_thread_id.lock().unwrap() = Some(thread_id.clone());
 
     let turn_response = match call(
         &mut reader,
         &stdin,
+        wire,
         "turn/start",
         json!({
             "threadId": thread_id,
@@ -216,8 +210,8 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
     ) {
         Ok(response) => response,
         Err(err) => {
-            finish_child(child, stdin, controls, pid, true);
-            return failed(err);
+            let stderr_text = finish_child(child, stderr.take(), stdin, controls, pid, true);
+            return failed(with_stderr(err, &stderr_text));
         }
     };
     let Some(turn_id) = turn_response
@@ -226,8 +220,11 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
         .and_then(Value::as_str)
         .map(str::to_string)
     else {
-        finish_child(child, stdin, controls, pid, true);
-        return failed("native turn/start response did not include turn.id".to_string());
+        let stderr_text = finish_child(child, stderr.take(), stdin, controls, pid, true);
+        return failed(with_stderr(
+            "native turn/start response did not include turn.id".to_string(),
+            &stderr_text,
+        ));
     };
     *shared_turn_id.lock().unwrap() = Some(turn_id.clone());
 
@@ -238,10 +235,13 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => break,
+            Ok(0) => {
+                failure_message = "native child closed stdout before turn/completed".to_string();
+                break;
+            }
             Ok(_) => {}
             Err(err) => {
-                failure_message = err.to_string();
+                failure_message = format!("native child stdout read failed: {err}");
                 break;
             }
         }
@@ -282,7 +282,11 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
         }
     }
 
-    finish_child(child, stdin, controls, pid, !success);
+    let stderr_text = finish_child(child, stderr, stdin, controls, pid, !success);
+    if !success {
+        failure_message = with_stderr(failure_message, &stderr_text);
+        eprintln!("native worker pid={pid} failed: {failure_message}");
+    }
     BackendExecutionResult {
         success,
         message: if success {
@@ -296,32 +300,41 @@ fn run_native_turn(turn: NativeTurn) -> BackendExecutionResult {
 
 fn finish_child(
     mut child: Child,
+    mut stderr: Option<ChildStderr>,
     stdin: Arc<Mutex<ChildStdin>>,
     controls: Arc<Mutex<HashMap<u32, NativeControl>>>,
     pid: u32,
     force_kill: bool,
-) {
+) -> String {
     controls.lock().unwrap().remove(&pid);
     drop(stdin);
     if !force_kill {
         for _ in 0..20 {
             if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
+                return read_stderr_text(&mut stderr);
             }
             thread::sleep(Duration::from_millis(100));
         }
     }
     let _ = terminate_process_tree(pid);
     let _ = child.wait();
+    if let Some(mut err) = stderr.take() {
+        let mut buf = String::new();
+        let _ = err.read_to_string(&mut buf);
+        return buf.trim().to_string();
+    }
+    String::new()
 }
 
 fn initialize(
-    reader: &mut BufReader<std::process::ChildStdout>,
+    reader: &mut BufReader<ChildStdout>,
     stdin: &Arc<Mutex<ChildStdin>>,
+    wire: NativeWire,
 ) -> Result<(), String> {
     call(
         reader,
         stdin,
+        wire,
         "initialize",
         json!({
             "clientInfo": {
@@ -342,16 +355,17 @@ fn initialize(
             }
         }),
     )?;
-    write_notification(stdin, "initialized", Value::Null)
+    write_notification(stdin, wire, "initialized", Value::Null)
 }
 
 fn call(
-    reader: &mut BufReader<std::process::ChildStdout>,
+    reader: &mut BufReader<ChildStdout>,
     stdin: &Arc<Mutex<ChildStdin>>,
+    wire: NativeWire,
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    let id = write_request(stdin, method, params)?;
+    let id = write_request(stdin, wire, method, params)?;
     let mut line = String::new();
     loop {
         line.clear();
@@ -374,30 +388,43 @@ fn call(
 
 fn write_request(
     stdin: &Arc<Mutex<ChildStdin>>,
+    wire: NativeWire,
     method: &str,
     params: Value,
 ) -> Result<String, String> {
     let id = next_request_id(method);
-    let request = json!({
-        "jsonrpc": "2.0",
+    let mut request = json!({
         "id": id,
         "method": method,
         "params": params
     });
+    if wire.include_jsonrpc {
+        request
+            .as_object_mut()
+            .expect("request object")
+            .insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
+    }
     write_json_line(stdin, &request)?;
     Ok(id)
 }
 
 fn write_notification(
     stdin: &Arc<Mutex<ChildStdin>>,
+    wire: NativeWire,
     method: &str,
     params: Value,
 ) -> Result<(), String> {
-    let request = if params.is_null() {
-        json!({"jsonrpc": "2.0", "method": method})
+    let mut request = if params.is_null() {
+        json!({"method": method})
     } else {
-        json!({"jsonrpc": "2.0", "method": method, "params": params})
+        json!({"method": method, "params": params})
     };
+    if wire.include_jsonrpc {
+        request
+            .as_object_mut()
+            .expect("request object")
+            .insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
+    }
     write_json_line(stdin, &request)
 }
 
@@ -460,10 +487,19 @@ fn native_list_sessions(
         .take()
         .ok_or_else(|| "failed to open native app-server stdout".to_string())?;
     let mut reader = BufReader::new(stdout);
-    initialize(&mut reader, &stdin)?;
+    initialize(
+        &mut reader,
+        &stdin,
+        NativeWire {
+            include_jsonrpc: false,
+        },
+    )?;
     let response = call(
         &mut reader,
         &stdin,
+        NativeWire {
+            include_jsonrpc: false,
+        },
         "thread/list",
         json!({
             "limit": limit,
@@ -507,6 +543,152 @@ fn thread_summary(thread: &Value) -> Option<BackendSessionSummary> {
             .map(|preview| Value::String(preview.chars().take(240).collect()))
             .unwrap_or(Value::Null),
     })
+}
+
+struct SpawnedNativeChild {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr: Option<ChildStderr>,
+    wire: NativeWire,
+}
+
+fn spawn_native_child(config: &Config) -> Result<SpawnedNativeChild, String> {
+    let attempts = [
+        (
+            vec!["remote-control".to_string()],
+            NativeWire {
+                include_jsonrpc: false,
+            },
+        ),
+        (
+            vec![
+                "app-server".to_string(),
+                "--listen".to_string(),
+                "stdio://".to_string(),
+            ],
+            NativeWire {
+                include_jsonrpc: false,
+            },
+        ),
+        (
+            vec![
+                "app-server".to_string(),
+                "--listen".to_string(),
+                "stdio://".to_string(),
+            ],
+            NativeWire {
+                include_jsonrpc: true,
+            },
+        ),
+    ];
+    let mut errors = Vec::new();
+    for (args, wire) in attempts {
+        let args_label = args.join(" ");
+        let mut command = Command::new(&config.codex_bin);
+        for arg in &args {
+            command.arg(arg);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child_process(&mut command);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                errors.push(format!("{args_label}: {err}"));
+                continue;
+            }
+        };
+        let pid = child.id();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = initialize_spawned_child(child, wire);
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(NATIVE_INIT_TIMEOUT) {
+            Ok(Ok(spawned)) => return Ok(spawned),
+            Ok(Err(err)) => errors.push(format!("{args_label}: {err}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = terminate_process_tree(pid);
+                errors.push(format!(
+                    "{args_label}: timed out waiting for native initialize response"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                errors.push(format!("{args_label}: initialize worker disconnected"));
+            }
+        }
+    }
+    Err(format!(
+        "failed to start native backend: {}",
+        errors.join(" | ")
+    ))
+}
+
+fn initialize_spawned_child(
+    mut child: Child,
+    wire: NativeWire,
+) -> Result<SpawnedNativeChild, String> {
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open native app-server stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to open native app-server stdout".to_string())?;
+    let mut stderr = child.stderr.take();
+    let stdin_arc = Arc::new(Mutex::new(stdin));
+    let mut reader = BufReader::new(stdout);
+    match initialize(&mut reader, &stdin_arc, wire) {
+        Ok(()) => {
+            let stdin = Arc::into_inner(stdin_arc)
+                .ok_or_else(|| "native stdin still shared unexpectedly".to_string())?
+                .into_inner()
+                .map_err(|_| "native stdin mutex poisoned".to_string())?;
+            let stdout = reader.into_inner();
+            Ok(SpawnedNativeChild {
+                child,
+                stdin,
+                stdout,
+                stderr,
+                wire,
+            })
+        }
+        Err(err) => {
+            let stderr_text = read_stderr_text(&mut stderr);
+            let _ = terminate_process_tree(child.id());
+            let _ = child.wait();
+            Err(format!("{err}{}", format_stderr_suffix(&stderr_text)))
+        }
+    }
+}
+
+fn read_stderr_text(stderr: &mut Option<ChildStderr>) -> String {
+    let Some(stderr) = stderr.as_mut() else {
+        return String::new();
+    };
+    let mut buf = String::new();
+    let _ = stderr.read_to_string(&mut buf);
+    buf.trim().to_string()
+}
+
+fn format_stderr_suffix(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(" | stderr: {stderr}")
+    }
+}
+
+fn with_stderr(message: String, stderr: &str) -> String {
+    if stderr.trim().is_empty() {
+        message
+    } else {
+        format!("{message} | stderr: {}", stderr.trim())
+    }
 }
 
 fn failed(message: String) -> BackendExecutionResult {

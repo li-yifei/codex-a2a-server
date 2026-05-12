@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +16,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PENDING_WORKER_STALE_GRACE_SECS: u64 = 60;
 
 struct Request {
     method: String,
@@ -474,7 +476,97 @@ fn cancel_task(id: Value, params: Value, state: AppState) -> (u16, Value) {
     (200, json!({"jsonrpc": "2.0", "result": task, "id": id}))
 }
 
+fn sweep_stale_working_tasks(state: &AppState) -> usize {
+    let running_pids = {
+        let running = state.running.lock().unwrap();
+        running
+            .values()
+            .map(|task| task.pid)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let now = now_unix_secs();
+    let mut removed = 0usize;
+    let mut tasks = state.tasks.lock().unwrap();
+    for task in tasks.values_mut() {
+        let is_working = task
+            .get("status")
+            .and_then(|status| status.get("state"))
+            .and_then(Value::as_str)
+            == Some("working");
+        if !is_working {
+            continue;
+        }
+        let task_id = task
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let context_id = task
+            .get("contextId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let pid = task
+            .get("metadata")
+            .and_then(|m| m.get("pid"))
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
+        let alive = pid.is_some_and(process_alive);
+        let tracked = pid.is_some_and(|pid| running_pids.contains(&pid));
+        if alive || tracked {
+            continue;
+        }
+        if pid.is_none() && working_task_age_secs(task, now) < PENDING_WORKER_STALE_GRACE_SECS {
+            continue;
+        }
+        *task = task_result(
+            &task_id,
+            "failed",
+            "Task became stale while still marked working",
+            &context_id,
+        );
+        annotate_task(task, &task_id, &context_id, false, false);
+        if let Some(metadata) = task.get_mut("metadata").and_then(Value::as_object_mut) {
+            metadata.insert("staleRecovered".to_string(), json!(true));
+            if let Some(pid) = pid {
+                metadata.insert("stalePid".to_string(), json!(pid));
+            }
+        }
+        removed += 1;
+    }
+    drop(tasks);
+    if removed > 0 {
+        let _ = save_task_registry(state);
+    }
+    removed
+}
+
+fn working_task_age_secs(task: &Value, now: u64) -> u64 {
+    let started_at = task
+        .get("metadata")
+        .and_then(|metadata| metadata.get("workerStartedAt"))
+        .or_else(|| {
+            task.get("metadata")
+                .and_then(|metadata| metadata.get("createdAt"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(now);
+    now.saturating_sub(started_at)
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn list_tasks(id: Value, params: Value, state: AppState) -> (u16, Value) {
+    sweep_stale_working_tasks(&state);
     let limit = params
         .get("limit")
         .and_then(Value::as_u64)
@@ -657,29 +749,63 @@ fn run_codex(
     deprecated_send_alias_used: bool,
     deprecated_context_alias_used: bool,
 ) {
-    if options.write_enabled {
-        let lock = write_lock(&state, &options.working_directory);
-        let _guard = lock.lock().unwrap();
-        run_codex_locked(
-            state,
-            task_id,
-            context_id,
-            text,
-            options,
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        if options.write_enabled {
+            let lock = write_lock(&state, &options.working_directory);
+            let _guard = lock.lock().unwrap();
+            run_codex_locked(
+                state.clone(),
+                task_id.clone(),
+                context_id.clone(),
+                text.clone(),
+                options.clone(),
+                deprecated_send_alias_used,
+                deprecated_context_alias_used,
+            );
+        } else {
+            run_codex_locked(
+                state.clone(),
+                task_id.clone(),
+                context_id.clone(),
+                text.clone(),
+                options.clone(),
+                deprecated_send_alias_used,
+                deprecated_context_alias_used,
+            );
+        }
+    }));
+    if let Err(payload) = result {
+        let message = format!("Codex worker panicked: {}", panic_payload_message(payload));
+        eprintln!("codex worker task {task_id} failed: {message}");
+        state.running.lock().unwrap().remove(&task_id);
+        if task_is_canceled(&state, &task_id) {
+            return;
+        }
+        let before = trace_before(&options);
+        let mut task =
+            task_result_with_trace(&task_id, "failed", &message, &context_id, &options, before);
+        annotate_task(
+            &mut task,
+            &task_id,
+            &context_id,
             deprecated_send_alias_used,
             deprecated_context_alias_used,
         );
-    } else {
-        run_codex_locked(
-            state,
-            task_id,
-            context_id,
-            text,
-            options,
-            deprecated_send_alias_used,
-            deprecated_context_alias_used,
-        );
+        if let Some(metadata) = task.get_mut("metadata").and_then(Value::as_object_mut) {
+            metadata.insert("workerPanic".to_string(), json!(true));
+        }
+        set_task(&state, &task_id, task);
     }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 fn run_codex_locked(
@@ -691,6 +817,7 @@ fn run_codex_locked(
     deprecated_send_alias_used: bool,
     deprecated_context_alias_used: bool,
 ) {
+    mark_worker_started(&state, &task_id);
     let resume_session_id = state
         .sessions
         .lock()
@@ -724,14 +851,25 @@ fn run_codex_locked(
             return;
         }
     };
+    let started_at = now_unix_secs();
     state.running.lock().unwrap().insert(
         task_id.clone(),
         RunningTask {
             pid: job.pid,
             context_id: context_id.clone(),
-            started_at: now_unix_secs(),
+            started_at,
         },
     );
+    {
+        let mut tasks = state.tasks.lock().unwrap();
+        if let Some(task) = tasks.get_mut(&task_id)
+            && let Some(metadata) = task.get_mut("metadata").and_then(Value::as_object_mut)
+        {
+            metadata.insert("pid".to_string(), json!(job.pid));
+            metadata.insert("startedAt".to_string(), json!(started_at));
+        }
+    }
+    let _ = save_task_registry(&state);
     let output = (job.wait)();
     state.running.lock().unwrap().remove(&task_id);
     if task_is_canceled(&state, &task_id) {
@@ -780,6 +918,18 @@ fn run_codex_locked(
         );
         set_task(&state, &task_id, task);
     }
+}
+
+fn mark_worker_started(state: &AppState, task_id: &str) {
+    {
+        let mut tasks = state.tasks.lock().unwrap();
+        if let Some(task) = tasks.get_mut(task_id)
+            && let Some(metadata) = task.get_mut("metadata").and_then(Value::as_object_mut)
+        {
+            metadata.insert("workerStartedAt".to_string(), json!(now_unix_secs()));
+        }
+    }
+    let _ = save_task_registry(state);
 }
 
 fn default_task_options(config: &Config) -> TaskOptions {
@@ -1316,6 +1466,7 @@ fn persist_new_working_task(
     task_id: &str,
     task: Value,
 ) -> Result<(), SubmitTaskError> {
+    sweep_stale_working_tasks(state);
     {
         let mut tasks = state.tasks.lock().unwrap();
         if tasks.contains_key(task_id) {
